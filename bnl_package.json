@@ -1,10 +1,17 @@
 {
   "name": "bnlang-web-socket",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "WebSocket server for Bnlang",
   "main": "index.bnl",
   "keywords": ["websocket", "ws", "bnlang", "Socket", "WebSocket server"],
   "author": "Mamun",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zobayerhossainmamun/bnlang-web-socket.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zobayerhossainmamun/bnlang-web-socket/issues"
+  },
   "dependencies": {}
 }
