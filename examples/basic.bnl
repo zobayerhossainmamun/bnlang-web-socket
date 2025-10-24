@@ -1,0 +1,37 @@
+const { createWSServer } = require("bnlang-web-socket");
+
+const ws = createWSServer({
+  path: "/ws",
+  heartbeat: 30_000,
+  maxPayload: 1048576,
+});
+
+ws.on("connection", (conn) => {
+  console.log(conn)
+  console.log("Client connected");
+  conn.sendText("Welcome to WS-only server!");
+  conn.join("lobby");
+});
+
+ws.on("message", (conn, msg) => {
+  if (typeof msg === "string") {
+    console.log("Received:", msg);
+    conn.sendText("Echo: " + msg.toUpperCase());
+    ws.broadcast(`[lobby] ${msg}`, "lobby");
+  } else {
+    console.log("Binary message:", msg.length, "bytes");
+    conn.sendText("(Binary data received)");
+  }
+});
+
+ws.on("close", (conn) => {
+  console.log("Client disconnected");
+});
+
+ws.on("error", (err) => {
+  console.error("WS error:", err?.message || err);
+});
+
+ws.start({ host: "127.0.0.1", port: 8080 }).then(() => {
+  console.log("WebSocket server listening on ws://127.0.0.1:8080/ws");
+});

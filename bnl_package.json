@@ -1,0 +1,10 @@
+{
+  "name": "bnlang-web-socket",
+  "version": "1.0.0",
+  "description": "WebSocket server for Bnlang",
+  "main": "index.bnl",
+  "keywords": ["websocket", "ws", "bnlang", "Socket", "WebSocket server"],
+  "author": "Mamun",
+  "license": "MIT",
+  "dependencies": {}
+}

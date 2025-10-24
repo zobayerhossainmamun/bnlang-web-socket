@@ -1,0 +1,38 @@
+"use strict";
+
+const http = require("http");
+const { WSServer } = require("./lib/ws.bnl");
+
+function createWSServer(options = {}) {
+  const {
+    path = "/ws",
+    heartbeat = 30_000,
+    maxPayload = 1 << 20,
+    protocols = null,
+  } = options;
+
+  const httpServer = http.createServer((req, res) => {
+    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("websocket-only\n");
+  });
+
+  const wsServer = new WSServer({ path, heartbeat, maxPayload, protocols }).attach(httpServer);
+
+  wsServer.start = ({ host = "127.0.0.1", port = 8080 } = {}) => new Promise((resolve, reject) => {
+      httpServer.listen(port, host, (err) => {
+        if (err) return reject(err);
+        resolve();
+      });
+  });
+
+  wsServer.stop = () =>
+    new Promise((resolve) => {
+      try { clearInterval(wsServer._hbTimer); } catch {}
+      for (const c of wsServer.clients) { try { c.close(1001, "server stopping"); } catch {} }
+      httpServer.close(() => resolve());
+    });
+
+  return wsServer;
+}
+
+module.exports = { createWSServer };

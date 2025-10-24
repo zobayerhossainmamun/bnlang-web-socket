@@ -1,0 +1,365 @@
+"use strict";
+
+const crypto = require("crypto");
+const { Buffer } = require("buffer");
+const { URL } = require("url");
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+function acceptKey(key) {
+  return crypto.createHash("sha1").update(key + WS_GUID).digest("base64");
+}
+
+function defaultIdFactory() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return crypto.randomBytes(16).toString("hex");
+}
+
+function encodeFrame(opcode, payload) {
+  const len = payload.length;
+  let headerLen = 2;
+  if (len >= 126 && len <= 0xffff) headerLen += 2;
+  else if (len > 0xffff) headerLen += 8;
+
+  const frame = Buffer.alloc(headerLen + len);
+  frame[0] = 0x80 | (opcode & 0x0f);
+  if (len < 126) {
+    frame[1] = len;
+    payload.copy(frame, 2);
+  } else if (len <= 0xffff) {
+    frame[1] = 126;
+    frame.writeUInt16BE(len, 2);
+    payload.copy(frame, 4);
+  } else {
+    frame[1] = 127;
+    const hi = Math.floor(len / 2 ** 32);
+    const lo = len >>> 0;
+    frame.writeUInt32BE(hi, 2);
+    frame.writeUInt32BE(lo, 6);
+    payload.copy(frame, 10);
+  }
+  return frame;
+}
+
+function encodeText(str)   { return encodeFrame(0x1, Buffer.from(str, "utf8")); }
+function encodeBinary(buf) { return encodeFrame(0x2, Buffer.isBuffer(buf) ? buf : Buffer.from(buf)); }
+function encodeClose(code = 1000, reason = "") {
+  const body = Buffer.alloc(2 + Buffer.byteLength(reason));
+  body.writeUInt16BE(code, 0);
+  if (reason) body.write(reason, 2);
+  return encodeFrame(0x8, body);
+}
+function encodePing() { return encodeFrame(0x9, Buffer.alloc(0)); }
+function encodePong() { return encodeFrame(0xA, Buffer.alloc(0)); }
+
+function decodeOne(buffer) {
+  if (buffer.length < 2) return null;
+
+  const b0 = buffer[0];
+  const b1 = buffer[1];
+  const fin = (b0 & 0x80) !== 0;
+  const opcode = b0 & 0x0f;
+  const masked = (b1 & 0x80) !== 0;
+
+  let len = b1 & 0x7f;
+  let offset = 2;
+
+  if (len === 126) {
+    if (buffer.length < offset + 2) return null;
+    len = buffer.readUInt16BE(offset); offset += 2;
+  } else if (len === 127) {
+    if (buffer.length < offset + 8) return null;
+    const hi = buffer.readUInt32BE(offset);
+    const lo = buffer.readUInt32BE(offset + 4);
+    offset += 8;
+    len = hi * 2 ** 32 + lo;
+  }
+
+  let maskKey = null;
+  if (masked) {
+    if (buffer.length < offset + 4) return null;
+    maskKey = buffer.slice(offset, offset + 4);
+    offset += 4;
+  }
+
+  if (buffer.length < offset + len) return null;
+
+  const maskedPayload = buffer.slice(offset, offset + len);
+  const bytesUsed = offset + len;
+
+  let payload = maskedPayload;
+  if (masked) {
+    payload = Buffer.alloc(len);
+    for (let i = 0; i < len; i++) payload[i] = maskedPayload[i] ^ maskKey[i % 4];
+  }
+
+  return { frame: { fin, opcode, masked, payload }, bytesUsed };
+}
+
+class WSConnection {
+  constructor(socket, server) {
+    this.socket = socket;
+    this.server = server;
+    this.id = server.idFactory();
+    this.isAlive = true;
+    this.rooms = new Set();
+    this._closed = false;
+
+    this._isWritable = true;
+
+    const markClosed = () => { this._closed = true; this._isWritable = false; };
+    socket.on("close", markClosed);
+    socket.on("end", markClosed);
+    socket.on("finish", markClosed);
+    socket.on("error", () => { /* swallow, server 'error' gets called elsewhere */ });
+
+    socket.on("drain", () => { this._isWritable = true; });
+  }
+
+  _write(buf) {
+    if (this._closed || this.socket.destroyed || !this.socket.writable) return false;
+    try {
+      const ok = this.socket.write(buf);
+      if (!ok) this._isWritable = false;
+      return ok;
+    } catch {
+      this._isWritable = false;
+      return false;
+    }
+  }
+
+  sendText(text)  { return this._write(encodeText(text)); }
+  sendBinary(buf) { return this._write(encodeBinary(buf)); }
+  ping()          { return this._write(encodePing()); }
+  pong()          { return this._write(encodePong()); }
+
+  close(code = 1000, reason = "") {
+    if (this._closed) return;
+    try { this._write(encodeClose(code, reason)); } catch {}
+    try { this.socket.end(); } catch {}
+    this._closed = true;
+    this._isWritable = false;
+  }
+
+  join(room) {
+    if (!room) return;
+    this.rooms.add(room);
+    let set = this.server._rooms.get(room);
+    if (!set) { set = new Set(); this.server._rooms.set(room, set); }
+    set.add(this);
+  }
+  leave(room) {
+    if (!room) return;
+    this.rooms.delete(room);
+    const set = this.server._rooms.get(room);
+    if (set) {
+      set.delete(this);
+      if (set.size === 0) this.server._rooms.delete(room);
+    }
+  }
+
+  _leaveAllRooms() {
+    for (const r of this.rooms) this.leave(r);
+  }
+}
+
+class WSServer {
+  constructor({ path = "/ws", heartbeat = 30000, maxPayload = 1 << 20, protocols = null, idFactory = defaultIdFactory } = {}) {
+    this.path = path;
+    this.heartbeat = heartbeat;
+    this.maxPayload = maxPayload;
+    this.protocols = Array.isArray(protocols) && protocols.length ? protocols : null;
+
+    this.idFactory = idFactory;
+
+    this.clients = new Set();
+    this.clientsById = new Map();
+    this._rooms = new Map();
+    this._handlers = { connection: null, message: null, close: null, error: null };
+    this._hbTimer = null;
+  }
+
+  getClient(id) { return this.clientsById.get(id) || null; }
+  sendTo(id, textOrBuffer) {
+    const c = this.getClient(id);
+    if (!c) return false;
+    return typeof textOrBuffer === "string" ? c.sendText(textOrBuffer) : c.sendBinary(textOrBuffer);
+  }
+  disconnect(id, code = 1000, reason = "bye") {
+    const c = this.getClient(id);
+    if (!c) return false;
+    c.close(code, reason);
+    return true;
+  }
+
+  on(event, fn) {
+    if (!(event in this._handlers)) throw new Error("Unknown event " + event);
+    this._handlers[event] = fn;
+  }
+
+  broadcast(textOrBuffer, room = null) {
+    const target = room ? this._rooms.get(room) : this.clients;
+    if (!target) return;
+    const toDrop = [];
+    for (const c of target) {
+      const ok = (typeof textOrBuffer === "string")
+        ? c.sendText(textOrBuffer)
+        : c.sendBinary(textOrBuffer);
+      if (!ok) toDrop.push(c);
+    }
+
+    for (const c of toDrop) {
+      c._leaveAllRooms();
+      this.clients.delete(c);
+      try { this._handlers.close && this._handlers.close(c); } catch {}
+    }
+  }
+
+  attach(httpServer) {
+    httpServer.on("upgrade", (req, socket, head) => {
+      console.log(req.url);
+      const { pathname } = new URL(req.url || "/");
+      if (pathname !== this.path) {
+        socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+        return socket.end();
+      }
+
+      const upgrade = (req.headers["upgrade"] || "").toLowerCase();
+      const key = req.headers["sec-websocket-key"];
+      const version = req.headers["sec-websocket-version"];
+      if (upgrade !== "websocket" || !key || version !== "13") {
+        socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+        return socket.end();
+      }
+
+      let selectedProtocol = null;
+      if (this.protocols) {
+        const offered = (req.headers["sec-websocket-protocol"] || "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        selectedProtocol = offered.find((p) => this.protocols.includes(p)) || null;
+      }
+
+      const accept = acceptKey(key);
+      const lines = [
+        "HTTP/1.1 101 Switching Protocols",
+        "Connection: Upgrade",
+        "Upgrade: websocket",
+        `Sec-WebSocket-Accept: ${accept}`,
+      ];
+      if (selectedProtocol) lines.push(`Sec-WebSocket-Protocol: ${selectedProtocol}`);
+      lines.push("\r\n");
+      socket.write(lines.join("\r\n"));
+
+      this._wireSocket(req, socket, head);
+    });
+
+    if (this.heartbeat > 0) {
+      this._hbTimer = setInterval(() => {
+        const toDrop = [];
+        for (const c of this.clients) {
+          if (c._closed || c.socket.destroyed || !c.socket.writable) {
+            toDrop.push(c);
+            continue;
+          }
+          if (!c.isAlive) {
+            c.close(1001, "No heartbeat");
+            toDrop.push(c);
+            continue;
+          }
+          c.isAlive = false;
+          c.ping();
+        }
+        for (const c of toDrop) {
+          c._leaveAllRooms();
+          this.clients.delete(c);
+          try { this._handlers.close && this._handlers.close(c); } catch {}
+        }
+      }, this.heartbeat);
+    }
+    return this;
+  }
+
+  _wireSocket(_req, socket, _head) {
+    const conn = new WSConnection(socket, this);
+    this.clients.add(conn);
+    this.clientsById.set(conn.id, conn);
+
+    try { this._handlers.connection && this._handlers.connection(conn); } catch (e) {
+      this._handlers.error && this._handlers.error(e, conn);
+    }
+
+    let buf = Buffer.alloc(0);
+
+    socket.on("data", (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      while (true) {
+        const decoded = decodeOne(buf);
+        if (!decoded) break;
+
+        const { frame, bytesUsed } = decoded;
+        buf = buf.slice(bytesUsed);
+
+        if (frame.payload.length > this.maxPayload) {
+          conn.close(1009, "Message too big");
+          return;
+        }
+
+        switch (frame.opcode) {
+          case 0x1: {
+            const text = frame.payload.toString("utf8");
+            try { this._handlers.message && this._handlers.message(conn, text); } catch (e) {
+              this._handlers.error && this._handlers.error(e, conn);
+            }
+            break;
+          }
+          case 0x2: {
+            const bin = frame.payload;
+            try { this._handlers.message && this._handlers.message(conn, bin); } catch (e) {
+              this._handlers.error && this._handlers.error(e, conn);
+            }
+            break;
+          }
+          case 0x8: {
+            try { socket.write(encodeClose()); } catch {}
+            try { socket.end(); } catch {}
+            conn._closed = true;
+            conn._isWritable = false;
+            conn._leaveAllRooms();
+            this.clients.delete(conn);
+            try { this._handlers.close && this._handlers.close(conn); } catch {}
+            return;
+          }
+          case 0x9: {
+            try { socket.write(encodePong()); } catch {}
+            break;
+          }
+          case 0xA: {
+            conn.isAlive = true;
+            break;
+          }
+          default:
+            break;
+        }
+      }
+    });
+
+    socket.on("close", () => {
+      conn._leaveAllRooms();
+      this.clients.delete(conn);
+      this.clientsById.delete(conn.id);
+      try { this._handlers.close && this._handlers.close(conn); } catch (e) {
+        this._handlers.error && this._handlers.error(e, conn);
+      }
+    });
+
+    socket.on("error", (err) => {
+      this._handlers.error && this._handlers.error(err, conn);
+    });
+  }
+}
+
+module.exports = {
+  WSServer,
+  encodeText, encodeBinary, encodeClose, encodePing, encodePong, decodeOne,
+};

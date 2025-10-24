@@ -1,0 +1,56 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Bnlang WebSocket demo</title>
+    <style>
+      body { font: 14px system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 20px; }
+      #log { border: 1px solid #ccc; padding: 10px; height: 220px; overflow: auto; white-space: pre-wrap; }
+      input, button { font: inherit; }
+    </style>
+  </head>
+  <body>
+    <h1>Bnlang WebSocket demo</h1>
+    <div>Server will upgrade <code>/ws</code> on the same origin.</div>
+    <p>
+      <input id="msg" placeholder="type something…" />
+      <button id="send">send</button>
+    </p>
+    <div id="log"></div>
+
+    <script>
+      const logEl = document.getElementById('log');
+      const msgEl = document.getElementById('msg');
+      const btn = document.getElementById('send');
+
+      function log(line) {
+        const ts = new Date().toISOString().slice(11, 19);
+        logEl.textContent += `[${ts}] ${line}\n`;
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      const wsUrl = 'ws://localhost:8080/ws';
+
+      log(`connecting to ${wsUrl} …`);
+      const ws = new WebSocket(wsUrl);
+
+      ws.addEventListener('open', () => log('open'));
+      ws.addEventListener('message', ev => log('recv: ' + ev.data));
+      ws.addEventListener('close', () => log('close'));
+      ws.addEventListener('error', () => log('error'));
+
+      btn.addEventListener('click', () => {
+        const text = msgEl.value || '';
+        if (text && ws.readyState === WebSocket.OPEN) {
+          ws.send(text);
+          log('sent: ' + text);
+          msgEl.value = '';
+        }
+      });
+
+      msgEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') btn.click();
+      });
+    </script>
+  </body>
+</html>
